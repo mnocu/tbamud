@@ -73,6 +73,23 @@ int count_non_protocol_chars(char * str);
 char *right_trim_whitespace(const char *string);
 void remove_from_string(char *string, const char *to_remove);
 
+/* Threading -Noah */
+#define THREAD_PASSIVE      -1
+#define THREAD_NORMAL       0
+#define THREAD_PERSISTANT   8         // Try changing this if you have problems
+#define THREAD_DEADLOCK     100
+
+int getlock(pthread_mutex_t *lock, byte persist); 
+#define TL(x)     (getlock(&x, THREAD_NORMAL))              /* Try once */
+#define GL(x)     (getlock(&x, THREAD_PERSISTANT))          /* Try THREAD_PERSISTENT + 1 times */
+#define SL(x, y)  (getlock(&x, y))                          /* User specified */
+#define RL(x)     (pthread_mutex_unlock(&x))                /* Unlock */
+/* For ease of managing descriptors */
+#define TDL(x)    (getlock(&x->locked, THREAD_NORMAL))      /* Try once */
+#define GDL(x)    (getlock(&x->locked, THREAD_PERSISTANT))  /* Try THREAD_PERSISTENT + 1 times */
+#define RDL(x)    (pthread_mutex_unlock(&x->locked))        /* Unlock descriptor */
+
+
 /* Public functions made available form weather.c */
 void weather_and_time(int mode);
 

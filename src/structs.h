@@ -15,6 +15,11 @@
 #include "protocol.h" /* Kavir Plugin*/
 #include "lists.h"
 
+/* TODO: pthread.h is only available on linux (and mac?)--  
+ * pthread-win32 is an option for Windows
+ */
+#include <pthread.h>
+
 /** If you want equipment to be automatically equipped to the same place
  * it was when players rented, set the define below to 1 because
  * TRUE/FALSE aren't defined yet. */
@@ -1107,6 +1112,8 @@ struct descriptor_data
   protocol_t *pProtocol;    /**< Kavir plugin */
   
   struct list_data * events;
+  
+  pthread_mutex_t locked;   /* Support for threading */
 };
 
 /* other miscellaneous structures */
