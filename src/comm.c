@@ -11,6 +11,11 @@
 #include "conf.h"
 #include "sysdep.h"
 
+/* TODO: pthread.h is only available on linux (and mac?)--  
+ * pthread-win32 is an option for Windows
+ */
+#include <pthread.h>
+
 /* Begin conf.h dependent includes */
 
 #if CIRCLE_GNU_LIBC_MEMORY_TRACK
@@ -106,6 +111,20 @@ socket_t mother_desc;
 int next_tick = SECS_PER_MUD_HOUR;  /* Tick countdown */
 /* used with do_tell and handle_webster_file utility */
 long last_webster_teller = -1L;
+
+/* Mutexes and other variables needed for threading */
+struct MThreads mudthreads = {
+  PTHREAD_MUTEX_INITIALIZER,    // descriptor_list_locked
+  PTHREAD_MUTEX_INITIALIZER,    // mother_desc_locked
+  PTHREAD_MUTEX_INITIALIZER,    // mtx_basic_mud_log
+  
+  /* Heartbeat thread control */
+  HB_SLEEPING,
+  PTHREAD_MUTEX_INITIALIZER,
+  PTHREAD_COND_INITIALIZER
+};
+
+pthread_mutex_t mtx_basic_mud_log = PTHREAD_MUTEX_INITIALIZER;
 
 /* static local global variable declarations (current file scope only) */
 static struct txt_block *bufpool = 0;  /* pool of large output buffers */
@@ -749,7 +768,11 @@ void game_loop(socket_t local_mother_desc)
   char comm[MAX_INPUT_LENGTH];
   struct descriptor_data *d, *next_d;
   int missed_pulses, maxdesc, aliased;
-
+  pthread_t hb; /* Heartbeat thread ID */
+  
+  log("Launching heartbeat thread.");
+  pthread_create(&hb, NULL, heartbeat, NULL);
+  
   /* initialize various time values */
   null_time.tv_sec = 0;
   null_time.tv_usec = 0;
@@ -764,16 +787,18 @@ void game_loop(socket_t local_mother_desc)
 
     /* Sleep if we don't have any connections */
     if (descriptor_list == NULL) {
+      GL(mudthreads.hb_locked);  /* Get the hb lock and don't release until awake */
+      mudthreads.hb_alive = HB_SLEEPING; /* Tell our other process to sleep */
       log("No connections.  Going to sleep.");
       FD_ZERO(&input_set);
       FD_SET(local_mother_desc, &input_set);
       if (select(local_mother_desc + 1, &input_set, (fd_set *) 0, (fd_set *) 0, NULL) < 0) {
-	if (errno == EINTR)
-	  log("Waking up to process signal.");
-	else
-	  perror("SYSERR: Select coma");
+        if (errno == EINTR)
+          log("Waking up to process signal.");
+        else
+          perror("SYSERR: Select coma");
       } else
-	log("New connection.  Waking up.");
+        log("New connection.  Waking up.");
       gettimeofday(&last_time, (struct timezone *) 0);
     }
     /* Set up the input, output, and exception sets for select(). */
@@ -784,15 +809,25 @@ void game_loop(socket_t local_mother_desc)
 
     maxdesc = local_mother_desc;
     for (d = descriptor_list; d; d = d->next) {
+      GDL(d);
 #ifndef CIRCLE_WINDOWS
       if (d->descriptor > maxdesc)
-	maxdesc = d->descriptor;
+        maxdesc = d->descriptor;
 #endif
       FD_SET(d->descriptor, &input_set);
       FD_SET(d->descriptor, &output_set);
       FD_SET(d->descriptor, &exc_set);
+      RDL(d);
     }
 
+    /* Trigger our heart to start beating... */
+    if (mudthreads.hb_alive == HB_SLEEPING) {
+      //log("Waking heartbeat thread...");
+      mudthreads.hb_alive = HB_AWAKE; /* we need a beating heart */
+      RL(mudthreads.hb_locked); 
+      pthread_cond_broadcast(&mudthreads.hb_resuscitate);
+    }
+    
     /* At this point, we have completed all input, output and heartbeat
      * activity from the previous iteration, so we have to put ourselves
      * to sleep until the next 0.1 second tick.  The first step is to
@@ -838,16 +873,20 @@ void game_loop(socket_t local_mother_desc)
 
     /* Kick out the freaky folks in the exception set and marked for close */
     for (d = descriptor_list; d; d = next_d) {
+      GDL(d);
       next_d = d->next;
       if (FD_ISSET(d->descriptor, &exc_set)) {
         FD_CLR(d->descriptor, &input_set);
 	      FD_CLR(d->descriptor, &output_set);
+        log("Calling close_socket() on d = %d", d->desc_num);
 	      close_socket(d);
       }
+      RDL(d);
     }
 
     /* Process descriptors with input pending */
     for (d = descriptor_list; d; d = next_d) {
+      GDL(d);
       next_d = d->next;
       if (FD_ISSET(d->descriptor, &input_set))
        {
@@ -856,11 +895,19 @@ void game_loop(socket_t local_mother_desc)
 	      if (process_input(d) < 0)
 	        close_socket(d);
        }
+       RDL(d);
     }
+  
+    /* Input */
 
     /* Process commands we just read from process_input */
     for (d = descriptor_list; d; d = next_d) {
-      next_d = d->next;
+      next_d = d->next;  
+          
+      if (GDL(d)) { // converted THREAD SAFETY: unable to get lock?
+        log("SYSNOTE: Skipping a pulse on descriptor #%d. (busy)", d->desc_num);
+        continue;
+      }
 
       /* Not combined to retain --(d->wait) behavior. -gg 2/20/98 If no wait
        * state, no subtraction.  If there is a wait state then 1 is subtracted.
@@ -869,72 +916,78 @@ void game_loop(socket_t local_mother_desc)
       if (d->character) {
         GET_WAIT_STATE(d->character) -= (GET_WAIT_STATE(d->character) > 0);
 
-        if (GET_WAIT_STATE(d->character))
+        if (GET_WAIT_STATE(d->character)) {
+          RDL(d);
           continue;
+        }
       }
 
-      if (!get_from_q(&d->input, comm, &aliased))
+      if (!get_from_q(&d->input, comm, &aliased)) {
+        RDL(d);
         continue;
+      }
 
       if (d->character) {
-	/* Reset the idle timer & pull char back from void if necessary */
-	d->character->char_specials.timer = 0;
-	if (STATE(d) == CON_PLAYING && GET_WAS_IN(d->character) != NOWHERE) {
-	  if (IN_ROOM(d->character) != NOWHERE)
-	    char_from_room(d->character);
-	  char_to_room(d->character, GET_WAS_IN(d->character));
-	  GET_WAS_IN(d->character) = NOWHERE;
-	  act("$n has returned.", TRUE, d->character, 0, 0, TO_ROOM);
-	}
+        /* Reset the idle timer & pull char back from void if necessary */
+        d->character->char_specials.timer = 0;
+        if (STATE(d) == CON_PLAYING && GET_WAS_IN(d->character) != NOWHERE) {
+          if (IN_ROOM(d->character) != NOWHERE)
+            char_from_room(d->character);
+          char_to_room(d->character, GET_WAS_IN(d->character));
+          GET_WAS_IN(d->character) = NOWHERE;
+          act("$n has returned.", TRUE, d->character, 0, 0, TO_ROOM);
+        }
         GET_WAIT_STATE(d->character) = 1;
       }
       d->has_prompt = FALSE;
 
       if (d->showstr_count) /* Reading something w/ pager */
-	show_string(d, comm);
+        show_string(d, comm);
       else if (d->str)		/* Writing boards, mail, etc. */
-	string_add(d, comm);
+        string_add(d, comm);
       else if (STATE(d) != CON_PLAYING) /* In menus, etc. */
-	nanny(d, comm);
+        nanny(d, comm);
       else {			/* else: we're playing normally. */
-	if (aliased)		/* To prevent recursive aliases. */
-	  d->has_prompt = TRUE;	/* To get newline before next cmd output. */
-	else if (perform_alias(d, comm, sizeof(comm)))    /* Run it through aliasing system */
-	  get_from_q(&d->input, comm, &aliased);
-	command_interpreter(d->character, comm); /* Send it to interpreter */
+        if (aliased)		/* To prevent recursive aliases. */
+          d->has_prompt = TRUE;	/* To get newline before next cmd output. */
+        else if (perform_alias(d, comm, sizeof(comm)))    /* Run it through aliasing system */
+          get_from_q(&d->input, comm, &aliased);
+        command_interpreter(d->character, comm); /* Send it to interpreter */
       }
+      RDL(d);
     }
+  
+    /* Output */
 
     /* Send queued output out to the operating system (ultimately to user). */
     for (d = descriptor_list; d; d = next_d) {
+      TDL(d);
       next_d = d->next;
       if (*(d->output) && FD_ISSET(d->descriptor, &output_set)) {
-	/* Output for this player is ready */
-	if (process_output(d) < 0)
-	  close_socket(d);
-	else
-	  d->has_prompt = 1;
+        /* Output for this player is ready */
+        if (process_output(d) < 0)
+          close_socket(d);
+        else
+          d->has_prompt = 1;
       }
-    }
-
-    /* Print prompts for other descriptors who had no other output */
-    for (d = descriptor_list; d; d = d->next) {
+      
+      // Print prompts for other descriptors who had no other output
       if (!d->has_prompt) {
 	      write_to_descriptor(d->descriptor, make_prompt(d));
 	      d->has_prompt = TRUE;
-      }
-    }
-
-    /* Kick out folks in the CON_CLOSE or CON_DISCONNECT state */
-    for (d = descriptor_list; d; d = next_d) {
-      next_d = d->next;
+      }      
+      
+      // Kick out folks in the CON_CLOSE or CON_DISCONNECT state 
       if (STATE(d) == CON_CLOSE || STATE(d) == CON_DISCONNECT)
-	close_socket(d);
+        close_socket(d);      
+      
+      RDL(d);
     }
 
     /* Now, we execute as many pulses as necessary--just one if we haven't
      * missed any pulses, or make up for lost time if we missed a few
      * pulses by sleeping for too long. */
+    
     missed_pulses++;
 
     if (missed_pulses <= 0) {
@@ -948,9 +1001,11 @@ void game_loop(socket_t local_mother_desc)
       missed_pulses = 30 RL_SEC;
     }
 
+    /* TODO: Adjust below to ifcheck for THREADING_ENABLED (once it exsits) 
+     * -Noah */
     /* Now execute the heartbeat functions */
-    while (missed_pulses--)
-      heartbeat(++pulse);
+    //while (missed_pulses--)
+    //  heartbeat(++pulse);
 
     /* Check for any signals we may have received. */
     if (reread_wizlist) {
@@ -977,59 +1032,132 @@ void game_loop(socket_t local_mother_desc)
     tics_passed++;
 #endif
   }
+  
+  /* Cleanup our other thread -Noah */
+  
+  log("Killing heartbeat thread.");
+  GL(mudthreads.hb_locked);
+  mudthreads.hb_alive = HB_DIE;
+  RL(mudthreads.hb_locked);
+  pthread_cond_broadcast(&mudthreads.hb_resuscitate);
+  pthread_join(hb, NULL); //rv);
+  log("Heartbeat thread dead; shutting down...");
+  
 }
 
-void heartbeat(int heart_pulse)
+void* heartbeat()
 {
   static int mins_since_crashsave = 0;
+  /* New thread which must cycle on a similar periodicity -Noah */
+  struct timeval last_time, opt_time, process_time, temp_time;
+  struct timeval before_sleep, now, timeout;
+  int missed_pulses;
+  unsigned int pulse_count = 0;
+  int pulse_multiplier = 1;
+  
+  /* initialize local time values */
+  opt_time.tv_usec = OPT_USEC;
+  opt_time.tv_sec = 0;
 
-  event_process();
-
-  if (!(heart_pulse % PULSE_DG_SCRIPT))
-    script_trigger_check();
-
-  if (!(heart_pulse % PASSES_PER_SEC)) {    /* EVERY second */
-    msdp_update();
-    next_tick--;
-  }
-
-  if (!(heart_pulse % PULSE_ZONE))
-    zone_update();
-
-  if (!(heart_pulse % PULSE_IDLEPWD))		/* 15 seconds */
-    check_idle_passwords();
-
-  if (!(heart_pulse % PULSE_MOBILE))
-    mobile_activity();
-
-  if (!(heart_pulse % PULSE_VIOLENCE))
-    perform_violence();
-
-  if (!(heart_pulse % (SECS_PER_MUD_HOUR * PASSES_PER_SEC))) {  /* Tick ! */
-    next_tick = SECS_PER_MUD_HOUR;  /* Reset tick coundown */
-    weather_and_time(1);
-    check_time_triggers();
-    affect_update();
-    point_update();
-    check_timed_quests();
-  }
-
-  if (CONFIG_AUTO_SAVE && !(heart_pulse % PULSE_AUTOSAVE)) {	/* 1 minute */
-    if (++mins_since_crashsave >= CONFIG_AUTOSAVE_TIME) {
-      mins_since_crashsave = 0;
-      Crash_save_all();
-      House_save_all();
+  gettimeofday(&last_time, (struct timezone *) 0);
+  
+  log("Heartbeat thread initialized.");
+  
+  while (!circle_shutdown)
+  {  
+    while (mudthreads.hb_alive == HB_SLEEPING) {
+      log("Heartbeat thread asleep after %d pulses.", pulse_multiplier * pulse_count);      
+      pulse_count = 0;
+      pthread_cond_wait(&mudthreads.hb_resuscitate, &mudthreads.hb_locked);
+      gettimeofday(&last_time, (struct timezone *) 0);   
+      log("Heartbeat thread waking.");      
     }
+    
+    if (mudthreads.hb_alive == HB_DIE)
+      pthread_exit(NULL);
+
+    gettimeofday(&before_sleep, (struct timezone *) 0); /* current time */
+    timediff(&process_time, &before_sleep, &last_time);
+
+    /* If we were asleep for more than one pass, count missed pulses and sleep
+     * until we're resynchronized with the next upcoming pulse. */
+    if (process_time.tv_sec == 0 && process_time.tv_usec < OPT_USEC) {
+      missed_pulses = 0;
+    } else {
+      missed_pulses = process_time.tv_sec * PASSES_PER_SEC;
+      missed_pulses += process_time.tv_usec / OPT_USEC;
+      process_time.tv_sec = 0;
+      process_time.tv_usec = process_time.tv_usec % OPT_USEC;
+    }
+
+    /* Calculate the time we should wake up */
+    timediff(&temp_time, &opt_time, &process_time);
+    timeadd(&last_time, &before_sleep, &temp_time);
+
+    /* Now keep sleeping until that time has come */
+    gettimeofday(&now, (struct timezone *) 0);
+    timediff(&timeout, &last_time, &now);
+
+    /* Go to sleep */
+    do {
+      circle_sleep(&timeout);
+      gettimeofday(&now, (struct timezone *) 0);
+      timediff(&timeout, &last_time, &now);
+    } while (timeout.tv_usec || timeout.tv_sec);
+
+    event_process();
+    pulse_count++;
+    pulse++;
+  
+    if (!(pulse % PULSE_DG_SCRIPT))
+      script_trigger_check();
+  
+    if (!(pulse % PASSES_PER_SEC)) {    /* EVERY second */
+      msdp_update();                    /* THREAD SAFETY: 0, 1 */
+      next_tick--;
+    }
+  
+    if (!(pulse % PULSE_ZONE))
+      zone_update();
+  
+    if (!(pulse % PULSE_IDLEPWD))		/* 15 seconds */
+      check_idle_passwords();
+  
+    if (!(pulse % PULSE_MOBILE))
+      mobile_activity();
+  
+    if (!(pulse % PULSE_VIOLENCE))
+      perform_violence();
+  
+    if (!(pulse % (SECS_PER_MUD_HOUR * PASSES_PER_SEC))) {  /* Tick ! */
+      next_tick = SECS_PER_MUD_HOUR;  /* Reset tick coundown */
+      weather_and_time(1);
+      check_time_triggers();
+      affect_update();
+      point_update();
+      check_timed_quests();
+    }
+  
+    if (CONFIG_AUTO_SAVE && !(pulse % PULSE_AUTOSAVE)) {	/* 1 minute */
+      if (++mins_since_crashsave >= CONFIG_AUTOSAVE_TIME) {
+        mins_since_crashsave = 0;
+        Crash_save_all();
+        House_save_all();
+      }
+    }
+  
+    if (!(pulse % PULSE_USAGE))
+      record_usage();
+  
+    if (!(pulse % PULSE_TIMESAVE))
+    save_mud_time(&time_info);
+  
+    /* Every pulse! Don't want them to stink the place up... */
+    extract_pending_chars();   
   }
-
-  if (!(heart_pulse % PULSE_USAGE))
-    record_usage();
-
-  if (!(heart_pulse % PULSE_TIMESAVE))
-  save_mud_time(&time_info);
-
-  /* Every pulse! Don't want them to stink the place up... */
-  extract_pending_chars();
+  
+  log("SYSNOTE: Shutdown killed heartbeat.");
+  pthread_exit(NULL);
 }
 
 /* new code to calculate time differences, which works on systems for which
@@ -1296,16 +1424,25 @@ size_t vwrite_to_output(struct descriptor_data *t, const char *format, va_list a
   size_t wantsize;
   int size;
 
+  if (GDL(t)) {
+    // TODO: MSGQUEUE -- add code here to capture msgs we are unable to 
+    // send becuase we can't get a lock. -Noah
+    ;
+  }
+
   /* if we're in the overflow state already, ignore this new output */
-  if (t->bufspace == 0)
+
+  if (t->bufspace == 0) {
+    RDL(t);
     return (0);
+  }
 
   wantsize = size = vsnprintf(txt, sizeof(txt), format, args);
 
-  strcpy(txt, ProtocolOutput( t, txt, (int*)&wantsize )); /* <--- Add this line */
-  size = wantsize;                    /* <--- Add this line */
-  if ( t->pProtocol->WriteOOB > 0 )   /* <--- Add this line */
-    --t->pProtocol->WriteOOB;         /* <--- Add this line */
+  strcpy(txt, ProtocolOutput( t, txt, (int*)&wantsize )); 
+  size = wantsize;                    
+  if ( t->pProtocol->WriteOOB > 0 )   
+    --t->pProtocol->WriteOOB;         
 
   /* If exceeding the size of the buffer, truncate it for the overflow message */
   if (size < 0 || wantsize >= sizeof(txt)) {
@@ -1328,6 +1465,7 @@ size_t vwrite_to_output(struct descriptor_data *t, const char *format, va_list a
     strcpy(t->output + t->bufptr, txt);	/* strcpy: OK (size checked above) */
     t->bufspace -= size;
     t->bufptr += size;
+    RDL(t);
     return (t->bufspace);
   }
 
@@ -1353,6 +1491,7 @@ size_t vwrite_to_output(struct descriptor_data *t, const char *format, va_list a
   /* calculate how much space is left in the buffer */
   t->bufspace = LARGE_BUFSIZE - 1 - t->bufptr;
 
+  RDL(t);
   return (t->bufspace);
 }
 
@@ -1455,6 +1594,11 @@ static int set_sendbuf(socket_t s)
 static void init_descriptor (struct descriptor_data *newd, int desc)
 {
   static int last_desc = 0;	/* last descriptor number */
+  pthread_mutexattr_t descriptor_lock_attributes;
+
+  pthread_mutexattr_init(&descriptor_lock_attributes);
+  pthread_mutexattr_settype(&descriptor_lock_attributes, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(&newd->locked, &descriptor_lock_attributes);  /* for multi-threaded operations */
 
   newd->descriptor = desc;
   newd->idle_tics = 0;
@@ -2140,7 +2284,8 @@ void close_socket(struct descriptor_data *d)
     default:
       break;
   }
-
+  
+  pthread_mutex_destroy(&d->locked); // THREAD SAFETY - destory the lock before freeing
   free(d);
 }
 
@@ -2340,9 +2485,14 @@ static void signal_setup(void)
 }
 
 #endif	/* CIRCLE_UNIX || CIRCLE_MACINTOSH */
+
 /* Public routines for system-to-player-communication. */
+
+/* game_info() sends messages to all players about certain game events */
 void game_info(const char *format, ...)
 {
+  /* THREAD SAFETY: No check for changes in state here, but we do check before 
+   * writing in vwrite_to_output() -Noah */
   struct descriptor_data *i;
   va_list args;
   char messg[MAX_STRING_LENGTH];
@@ -2350,11 +2500,9 @@ void game_info(const char *format, ...)
     return;
   sprintf(messg, "\tcInfo: \ty");
   for (i = descriptor_list; i; i = i->next) {
-    if (STATE(i) != CON_PLAYING)
+    if (!(i->character) || (STATE(i) != CON_PLAYING))
       continue;
-    if (!(i->character))
-      continue;
-
+    
     write_to_output(i, "%s", messg);
     va_start(args, format);
     vwrite_to_output(i, format, args);
@@ -2365,6 +2513,8 @@ void game_info(const char *format, ...)
 
 size_t send_to_char(struct char_data *ch, const char *messg, ...)
 {
+  /* THREAD SAFETY: No check for changes in state here, but we do check before 
+   * writing in vwrite_to_output() -Noah */
   if (ch->desc && messg && *messg) {
     size_t left;
     va_list args;
@@ -2379,6 +2529,8 @@ size_t send_to_char(struct char_data *ch, const char *messg, ...)
 
 void send_to_all(const char *messg, ...)
 {
+  /* THREAD SAFETY: No check for changes in state here, but we do check before 
+   * writing in vwrite_to_output() -Noah */
   struct descriptor_data *i;
   va_list args;
 
@@ -2397,6 +2549,8 @@ void send_to_all(const char *messg, ...)
 
 void send_to_outdoor(const char *messg, ...)
 {
+  /* THREAD SAFETY: No check for changes in state here, but we do check before 
+   * writing in vwrite_to_output() -Noah */
   struct descriptor_data *i;
   va_list args;
 
@@ -2418,6 +2572,8 @@ void send_to_outdoor(const char *messg, ...)
 
 void send_to_room(room_rnum room, const char *messg, ...)
 {
+  /* THREAD SAFETY: No check for changes in state here, but we do check before 
+   * writing in vwrite_to_output() -Noah */
   struct char_data *i;
   va_list args;
 
@@ -2439,6 +2595,8 @@ void send_to_room(room_rnum room, const char *messg, ...)
  * everyone. -Vatiken */
 void send_to_group(struct char_data *ch, struct group_data *group, const char * msg, ...)
 {
+  /* THREAD SAFETY: No check for changes in state here, but we do check before 
+   * writing in vwrite_to_output() -Noah */
 	struct char_data *tch;
   va_list args;
 
@@ -2460,6 +2618,8 @@ void send_to_group(struct char_data *ch, struct group_data *group, const char * 
 /* Thx to Jamie Nelson of 4D for this contribution */
 void send_to_range(room_vnum start, room_vnum finish, const char *messg, ...)
 {
+  /* THREAD SAFETY: No check for changes in state here, but we do check before 
+   * writing in vwrite_to_output() -Noah */
   struct char_data *i;
   va_list args;
   int j;
@@ -2504,94 +2664,95 @@ void perform_act(const char *orig, struct char_data *ch, struct obj_data *obj,
   for (;;) {
     if (*orig == '$') {
       switch (*(++orig)) {
-      case 'n':
-	i = PERS(ch, to);
-	break;
-      case 'N':
-	CHECK_NULL(vict_obj, PERS((const struct char_data *) vict_obj, to));
-	dg_victim = (struct char_data *) vict_obj;
-	break;
-      case 'm':
-	i = HMHR(ch);
-	break;
-      case 'M':
-	CHECK_NULL(vict_obj, HMHR((const struct char_data *) vict_obj));
-	dg_victim = (struct char_data *) vict_obj;
-	break;
-      case 's':
-	i = HSHR(ch);
-	break;
-      case 'S':
-	CHECK_NULL(vict_obj, HSHR((const struct char_data *) vict_obj));
-	dg_victim = (struct char_data *) vict_obj;
-	break;
-      case 'e':
-	i = HSSH(ch);
-	break;
-      case 'E':
-	CHECK_NULL(vict_obj, HSSH((const struct char_data *) vict_obj));
-	dg_victim = (struct char_data *) vict_obj;
-	break;
-      case 'o':
-	CHECK_NULL(obj, OBJN(obj, to));
-	break;
-      case 'O':
-	CHECK_NULL(vict_obj, OBJN((const struct obj_data *) vict_obj, to));
-	dg_target = (struct obj_data *) vict_obj;
-	break;
-      case 'p':
-	CHECK_NULL(obj, OBJS(obj, to));
-	break;
-      case 'P':
-	CHECK_NULL(vict_obj, OBJS((const struct obj_data *) vict_obj, to));
-	dg_target = (struct obj_data *) vict_obj;
-	break;
-      case 'a':
-	CHECK_NULL(obj, SANA(obj));
-	break;
-      case 'A':
-	CHECK_NULL(vict_obj, SANA((const struct obj_data *) vict_obj));
-	dg_target = (struct obj_data *) vict_obj;
-	break;
-       case 'T':
- 	CHECK_NULL(vict_obj, (const char *) vict_obj);
- 	dg_arg = (char *) vict_obj;
-	break;
-      case 't':
- 	CHECK_NULL(obj, (char *) obj);
-	break;
-      case 'F':
-	CHECK_NULL(vict_obj, fname((const char *) vict_obj));
-	break;
-      /* uppercase previous word */
-      case 'u':
-        for (j=buf; j > lbuf && !isspace((int) *(j-1)); j--);
-        if (j != buf)
-          *j = UPPER(*j);
-        i = "";
-        break;
-      /* uppercase next word */
-      case 'U':
-        uppercasenext = TRUE;
-        i = "";
-        break;
-      case '$':
-	i = "$";
-	break;
-      default:
-	log("SYSERR: Illegal $-code to act(): %c", *orig);
-	log("SYSERR: %s", orig);
-	i = "";
-	break;
+        case 'n':
+          i = PERS(ch, to);
+          break;
+        case 'N':
+          CHECK_NULL(vict_obj, PERS((const struct char_data *) vict_obj, to));
+          dg_victim = (struct char_data *) vict_obj;
+          break;
+        case 'm':
+          i = HMHR(ch);
+          break;
+        case 'M':
+          CHECK_NULL(vict_obj, HMHR((const struct char_data *) vict_obj));
+          dg_victim = (struct char_data *) vict_obj;
+          break;
+        case 's':
+          i = HSHR(ch);
+          break;
+        case 'S':
+          CHECK_NULL(vict_obj, HSHR((const struct char_data *) vict_obj));
+          dg_victim = (struct char_data *) vict_obj;
+          break;
+        case 'e':
+          i = HSSH(ch);
+          break;
+        case 'E':
+          CHECK_NULL(vict_obj, HSSH((const struct char_data *) vict_obj));
+          dg_victim = (struct char_data *) vict_obj;
+          break;
+        case 'o':
+          CHECK_NULL(obj, OBJN(obj, to));
+          break;
+        case 'O':
+          CHECK_NULL(vict_obj, OBJN((const struct obj_data *) vict_obj, to));
+          dg_target = (struct obj_data *) vict_obj;
+          break;
+        case 'p':
+          CHECK_NULL(obj, OBJS(obj, to));
+          break;
+        case 'P':
+          CHECK_NULL(vict_obj, OBJS((const struct obj_data *) vict_obj, to));
+          dg_target = (struct obj_data *) vict_obj;
+          break;
+        case 'a':
+          CHECK_NULL(obj, SANA(obj));
+          break;
+        case 'A':
+          CHECK_NULL(vict_obj, SANA((const struct obj_data *) vict_obj));
+          dg_target = (struct obj_data *) vict_obj;
+          break;
+        case 'T':
+          CHECK_NULL(vict_obj, (const char *) vict_obj);
+          dg_arg = (char *) vict_obj;
+          break;
+        case 't':
+          CHECK_NULL(obj, (char *) obj);
+          break;
+        case 'F':
+          CHECK_NULL(vict_obj, fname((const char *) vict_obj));
+          break;
+        /* uppercase previous word */
+        case 'u':
+          for (j=buf; j > lbuf && !isspace((int) *(j-1)); j--);
+          if (j != buf)
+            *j = UPPER(*j);
+          i = "";
+          break;
+        /* uppercase next word */
+        case 'U':
+          uppercasenext = TRUE;
+          i = "";
+          break;
+        case '$':
+          i = "$";
+          break;
+        default:
+          log("SYSERR: Illegal $-code to act(): %c", *orig);
+          log("SYSERR: %s", orig);
+          i = "";
+          break;
       }
+      
       while ((*buf = *(i++)))
         {
-        if (uppercasenext && !isspace((int) *buf))
-          {
-          *buf = UPPER(*buf);
-          uppercasenext = FALSE;
-          }
-	buf++;
+          if (uppercasenext && !isspace((int) *buf))
+            {
+            *buf = UPPER(*buf);
+            uppercasenext = FALSE;
+            }
+          buf++;
         }
       orig++;
     } else if (!(*(buf++) = *(orig++))) {
@@ -2829,6 +2990,12 @@ static void msdp_update( void )
 
   for (d = descriptor_list; d; d = d->next)
   {
+    if (GDL(d)) {
+      log("SYSNOTE: Could not update MSDP for descpritor %d (%s)", d->desc_num,
+        (d->character == NULL) ? "NULL" : GET_NAME(d->character));
+      continue;
+    }
+    
     struct char_data *ch = d->character;
     if ( ch && !IS_NPC(ch) && d->connected == CON_PLAYING )
     {
@@ -2878,5 +3045,7 @@ static void msdp_update( void )
      * snippet simple.  Optimise as you see fit.
      */
     MSSPSetPlayers( PlayerCount );
+    
+    RDL(d);
   }
 }

@@ -57,11 +57,29 @@ typedef RETSIGTYPE sigfunc(int);
 void echo_off(struct descriptor_data *d);
 void echo_on(struct descriptor_data *d);
 void game_loop(socket_t mother_desc);
-void heartbeat(int heart_pulse);
+void* heartbeat();
 void copyover_recover(void);
 
 /** webster dictionary lookup */
 extern long last_webster_teller;
+
+/* Thread management -- mutexes and misc logistics -Noah Cunningham */
+#define HB_SLEEPING   0
+#define HB_AWAKE      1
+#define HB_DIE        2
+
+struct MThreads { 
+  pthread_mutex_t descriptor_list_locked;     // For locking the descrpitor_list global
+  pthread_mutex_t mother_desc_locked;  
+  pthread_mutex_t mtx_basic_mud_log;  
+ 
+  /* Heartbeat thread control */
+  int hb_alive;                  // For signaling that we need heartbeats 
+  pthread_mutex_t hb_locked;     // For locking the thread
+  pthread_cond_t hb_resuscitate; // For waking up the thread 
+} ;
+
+extern struct MThreads mudthreads;
 
 extern struct descriptor_data *descriptor_list;
 extern int buf_largecount;

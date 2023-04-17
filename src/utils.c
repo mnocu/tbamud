@@ -23,6 +23,10 @@
 #include "interpreter.h"
 #include "class.h"
 
+/* TODO: pthread.h is only available on linux (and mac?)--  
+ * pthread-win32 is an option for Windows
+ */
+#include <pthread.h>
 
 /** Aportable random number function.
  * @param from The lower bounds of the random number.
@@ -1554,3 +1558,51 @@ void remove_from_string(char *string, const char *to_remove)
     }
     
 }
+
+
+/* getlock() will try (persist + 1) times to get the lock, unless persist is 
+ * greater than or equal to THREAD_DEADLOCK, in which case it will risk 
+ * deadlocking the game to get the lock.
+ * -Noah Cunningham */
+int getlock(pthread_mutex_t *lock, byte persist) 
+{
+  int i, a = -1;
+  struct timespec treq, trem;
+  
+  treq.tv_sec = 0;
+  
+  /* Are we willing to DEADLOCK for this? */
+  if (persist >= THREAD_DEADLOCK) {
+    // TODO: Add a preference for logging this (debug?) */
+    log("SYSNOTE: Deadlock mutex lock request received for mem address %p -- possible DEADLOCK point.", lock);
+    a = pthread_mutex_trylock(lock);
+    return(a);
+  }
+  
+  /* Loop to attempt to get the lock: persist + 1 times */
+  for (i=0; i <= persist; i++)
+  {
+    switch (a = pthread_mutex_trylock(lock))
+    {
+      case 0:       /* Success - We have the lock in this thread */
+      case EDEADLK: /* Success - We already had the lock */
+        if (i>0) log("Achieved lock on try number %d.", i); // For debugging
+        return 0;   
+        break;
+        
+      /* Insert any other specific cases you want to handle here. */
+      
+      default:
+        break;
+    }
+    
+    /* sleep between 10 and 100 nanoseconds */
+    treq.tv_nsec = (rand() % 10) * 10 + 5; 
+    nanosleep(&treq, &trem);
+  }
+  
+  // TODO: Add a preference for logging this (debug?) */
+  log("SYSNOTE: Unable to obtain mutex lock after %x tries -- error code: %d  in getlock() [utils.c]", persist, a);
+  return a;
+}
+
